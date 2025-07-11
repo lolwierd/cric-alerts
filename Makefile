@@ -1,0 +1,4 @@
+export
+
+run:
+	go run .
