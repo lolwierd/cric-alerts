@@ -34,6 +34,7 @@ type MatchState struct {
 	Team2             string
 	Score             string
 	Overs             string
+	OversLeft         string
 	RunRate           string
 	Status            string
 	LastWicket        string
@@ -215,22 +216,26 @@ func processMatch(href string, config Config, matchStates map[string]*MatchState
 
 	// Alerting logic
 	if config.AlertOnToss && !prevState.tossAlerted() && strings.Contains(newState.Toss, "won") {
-		sendDiscordAlert(config, "Toss Update", 0x00ff00, &newState)
+		sendDiscordAlert(config, fmt.Sprintf("Toss: %s", newState.Toss), 0x00ff00, &newState)
 	}
 
 	if config.AlertOnStart && !prevState.gameStarted() && strings.Contains(newState.Score, "/") {
-		sendDiscordAlert(config, "Match Started!", 0x00ff00, &newState)
+		sendDiscordAlert(config, "Match Started", 0x00ff00, &newState)
 		prevState.Score = "started"
 	}
 
 	if newState.Score != "" && prevState.Score != "started" && prevState.Score != newState.Score {
 		if config.AlertOnWicket && isWicketFall(prevState.Score, newState.Score) {
-			sendDiscordAlert(config, "Wicket!", 0xff0000, &newState)
+			title := "Wicket"
+			if newState.LastWicket != "" {
+				title = fmt.Sprintf("Wicket: %s", newState.LastWicket)
+			}
+			sendDiscordAlert(config, title, 0xff0000, &newState)
 		}
 
 		currentOver, _ := strconv.Atoi(strings.Split(newState.Overs, ".")[0])
 		if config.AlertOnScoreEvery > 0 && currentOver > prevState.LastAlertedOver && currentOver%config.AlertOnScoreEvery == 0 {
-			sendDiscordAlert(config, "Score Update", 0x0000ff, &newState)
+			sendDiscordAlert(config, fmt.Sprintf("Score Update: %s (%s)", newState.Score, newState.Overs), 0x0000ff, &newState)
 			newState.LastAlertedOver = currentOver
 		}
 	}
@@ -310,6 +315,16 @@ func parseScorecard(doc *goquery.Document) MatchState {
 		state.Overs = ""
 	}
 	log.Printf("Score: %s, Overs: %s", state.Score, state.Overs)
+
+	if state.Format == "Test" && state.Overs != "" {
+		if ov, err := strconv.ParseFloat(state.Overs, 64); err == nil {
+			left := 90.0 - ov
+			if left < 0 {
+				left = 0
+			}
+			state.OversLeft = fmt.Sprintf("%.1f overs left today", left)
+		}
+	}
 
 	// Run Rate
 	runRateText := doc.Find("span:contains('CRR:')").Next().Text()
@@ -392,7 +407,8 @@ func checkPlayerMilestones(config Config, prev, current *MatchState) {
 		lastMilestone := prev.NotifiedMilestone[p.Name]
 		for _, milestone := range config.PlayerMilestones {
 			if p.Runs >= milestone && lastMilestone < milestone {
-				sendDiscordAlert(config, "Milestone!", 0xffd700, current)
+				title := fmt.Sprintf("Milestone: %s reached %d", p.Name, milestone)
+				sendDiscordAlert(config, title, 0xffd700, current)
 				current.NotifiedMilestone[p.Name] = milestone
 			}
 		}
@@ -475,9 +491,15 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 		fields = append(fields, DiscordEmbedField{Name: "Toss", Value: state.Toss, Inline: false})
 	}
 
+	// Overs left in day for Tests
+	if state.OversLeft != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Overs Left", Value: state.OversLeft, Inline: true})
+	}
+
+	description := fmt.Sprintf("%s v %s - %s %s\n%s", state.Team1, state.Team2, state.Event, state.Format, state.Status)
 	discordEmbed := DiscordEmbed{
-		Title:       fmt.Sprintf("%s v %s - %s %s", state.Team1, state.Team2, state.Event, state.Format),
-		Description: state.Status,
+		Title:       title,
+		Description: description,
 		Color:       color,
 		Fields:      fields,
 		Footer: &DiscordEmbedFooter{
