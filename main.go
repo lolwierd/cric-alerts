@@ -425,8 +425,26 @@ func getWickets(score string) int {
 	return 0
 }
 
+// extractSession extracts the session or break information from the match status.
+// Examples: "Day 1: Lunch", "Day 2: Stumps", "Session 2".
+func extractSession(status string) string {
+	re := regexp.MustCompile(`(?i)(Stumps|Lunch|Tea|Session\s*\d+)`)
+	match := re.FindString(status)
+	return match
+}
+
+// extractRemaining overs/balls information if present in the status text.
+func extractRemaining(status string) string {
+	re := regexp.MustCompile(`(?i)(\d+\.?\d*\s*(?:overs?|balls?)\s*(?:left|remaining))`)
+	match := re.FindString(status)
+	return match
+}
+
 func sendDiscordAlert(config Config, title string, color int, state *MatchState) {
 	var fields []DiscordEmbedField
+
+	// Event that triggered the alert
+	fields = append(fields, DiscordEmbedField{Name: "Update", Value: title, Inline: false})
 
 	// Main Score and Overs
 	if state.Score != "" {
@@ -475,9 +493,19 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 		fields = append(fields, DiscordEmbedField{Name: "Toss", Value: state.Toss, Inline: false})
 	}
 
+	// Session information extracted from status
+	if session := extractSession(state.Status); session != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Session", Value: session, Inline: true})
+	}
+
+	// Overs/balls remaining information if available
+	if rem := extractRemaining(state.Status); rem != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Remaining", Value: rem, Inline: true})
+	}
+
 	discordEmbed := DiscordEmbed{
 		Title:       fmt.Sprintf("%s v %s - %s %s", state.Team1, state.Team2, state.Event, state.Format),
-		Description: state.Status,
+		Description: fmt.Sprintf("%s\n**%s**", state.Status, title),
 		Color:       color,
 		Fields:      fields,
 		Footer: &DiscordEmbedFooter{
