@@ -45,9 +45,13 @@ type MatchState struct {
 	LastAlertedOver   int
 	NotifiedMilestone map[string]int
 	Toss              string
-	Event             string // New field for the event/series name
+	Series            string // Series/tournament name
 	Format            string // New field for match format (Test/ODI/T20)
 	Venue             string // Venue of the match
+	YetToBat    string
+	TargetRuns  int
+	TargetBalls int
+	LastFoW     string
 }
 
 // Player represents a player's score.
@@ -246,6 +250,24 @@ func processMatch(href string, config Config) {
 	newState.LastAlertedOver = prevState.LastAlertedOver
 	newState.NotifiedMilestone = prevState.NotifiedMilestone
 
+	// decide alert cadence & milestones by match format
+	var scoreAlertEvery int
+	var milestones []int
+	switch strings.ToUpper(newState.Format) {
+	case "T20", "T20I":
+		scoreAlertEvery = 2
+		milestones = []int{30, 50, 75, 100}
+	case "ODI":
+		scoreAlertEvery = 5
+		milestones = []int{50, 100, 150}
+	case "TEST":
+		scoreAlertEvery = 10
+		milestones = []int{50, 100, 150, 200, 250, 300}
+	default:
+		scoreAlertEvery = config.AlertOnScoreEvery
+		milestones = config.PlayerMilestones
+	}
+
 	log.Printf("Current state for match %s: %s vs %s, %s, %s %s, CRR: %s", matchID, newState.Team1, newState.Team2, newState.Status, newState.Score, newState.Overs, newState.RunRate)
 	log.Printf("Batsmen: %+v, Bowler: %+v", newState.CurrentPlayers, newState.CurrentBowler)
 	log.Printf("Partnership: %s, Last Wicket: %s, Recent: %s, Toss: %s", newState.Partnership, newState.LastWicket, newState.RecentOvers, newState.Toss)
@@ -261,7 +283,8 @@ func processMatch(href string, config Config) {
 	}
 
 	if newState.Score != "" && prevState.Score != "started" && prevState.Score != newState.Score {
-		if config.AlertOnWicket && isWicketFall(prevState.Score, newState.Score) {
+		if config.AlertOnWicket && isWicketFall(prevState.Score, newState.Score) &&
+			newState.LastWicket != "" && newState.LastWicket != prevState.LastWicket {
 			title := "Wicket"
 			if newState.LastWicket != "" {
 				title = fmt.Sprintf("Wicket: %s", newState.LastWicket)
@@ -270,13 +293,13 @@ func processMatch(href string, config Config) {
 		}
 
 		currentOver, _ := strconv.Atoi(strings.Split(newState.Overs, ".")[0])
-		if config.AlertOnScoreEvery > 0 && currentOver > prevState.LastAlertedOver && currentOver%config.AlertOnScoreEvery == 0 {
+		if scoreAlertEvery > 0 && currentOver > prevState.LastAlertedOver && currentOver%scoreAlertEvery == 0 {
 			sendDiscordAlert(config, "Score Update", 0x0000ff, &newState)
 			newState.LastAlertedOver = currentOver
 		}
 	}
 
-	checkPlayerMilestones(config, prevState, &newState)
+	checkPlayerMilestones(config, prevState, &newState, milestones)
 
 	mu.Lock()
 	matchStates[matchID] = &newState
@@ -286,53 +309,63 @@ func processMatch(href string, config Config) {
 func parseScorecard(doc *goquery.Document) MatchState {
 	var state MatchState
 
-	// Extract Team1 and Team2 from the title tag
+	// Try to capture the two teams. Works for "A vs B, ..." or "A v B, ..."
 	fullTitle := doc.Find("title").Text()
 	titleParts := strings.Split(fullTitle, " | ")[0]
-	// Regex to capture "Team1 v Team2" from "Team1 v Team2, 3rd Test..." or "Team1 v Team2, Some League"
-	teamNamesRegex := regexp.MustCompile(`(.+?)\s+v\s+(.+?)(?:,\s+\d(?:st|nd|rd|th)?\s+Test|,.*|$)`)
-	teamMatches := teamNamesRegex.FindStringSubmatch(titleParts)
+	teamRegex := regexp.MustCompile(`(?i)([^,]+?)\s+v(?:s)?\.?\s+([^,]+?)(?:,|$)`)
+	var teamMatches []string
+
+	// first attempt: from the <title>
+	teamMatches = teamRegex.FindStringSubmatch(titleParts)
+	// second attempt: from the nav sub‑header text (often more reliable)
+	if len(teamMatches) <= 2 {
+		navText := strings.TrimSpace(doc.Find(".cb-nav-subhdr").Text())
+		teamMatches = teamRegex.FindStringSubmatch(navText)
+	}
+
 	if len(teamMatches) > 2 {
 		state.Team1 = strings.TrimSpace(teamMatches[1])
 		state.Team2 = strings.TrimSpace(teamMatches[2])
 	} else {
-		// Fallback if the specific regex for Test matches or other formats fails
-		// Try to get from the main score section if available
-		state.Team1 = strings.TrimSpace(doc.Find(".cb-scrs-wrp .cb-text-gray").First().Text())
-		state.Team2 = strings.TrimSpace(doc.Find(".cb-scrs-wrp .cb-font-20").First().Text())
+		// last‑ditch fallback: infer from the first scoreline
+		scoreLine := strings.TrimSpace(doc.Find(".cb-min-pad-lft .cb-font-20.text-bold").First().Text())
+		if scoreLine == "" {
+			scoreLine = strings.TrimSpace(doc.Find(".cb-lv-main .cb-font-20").First().Text())
+		}
+		parts := strings.Fields(scoreLine)
+		if len(parts) > 0 {
+			state.Team2 = parts[0] // batting team in the live score
+		}
+		// leave Team1 blank if we truly can’t find it – better than garbage like "CRR:"
 	}
 	log.Printf("Parsed Team1: %s, Team2: %s", state.Team1, state.Team2)
 
-	// Extract Event/Series Name
-	eventRegex := regexp.MustCompile(`(?:,\s+\d(?:st|nd|rd|th)?\s+Test|,\s+\d{1,2}\s+\w{3}\s+\d{4},?)\s*(.*?),\s*Live Cricket Score`)
-	eventMatches := eventRegex.FindStringSubmatch(fullTitle)
-	if len(eventMatches) > 1 {
-		state.Event = strings.TrimSpace(eventMatches[1])
-		// Clean up common prefixes/suffixes if necessary
-		state.Event = strings.TrimPrefix(state.Event, ", ")
-		state.Event = strings.TrimSuffix(state.Event, ", Live Cricket Score")
-	} else {
-		// Fallback: try to extract from the title parts if the specific regex fails
-		parts := strings.Split(titleParts, ",")
-		if len(parts) > 2 {
-			state.Event = strings.TrimSpace(parts[2])
-		}
+	// Series name from nav sub‑header (first <a> inside)
+	seriesName := strings.TrimSpace(doc.Find(".cb-nav-subhdr a").First().Text())
+	if seriesName != "" {
+		state.Series = seriesName
 	}
-	log.Printf("Parsed Event: %s", state.Event)
 
 	// Extract Match Format
-	formatRegex := regexp.MustCompile(`(\d+(?:st|nd|rd|th)?\s+(Test|ODI|T20I|T20))`)
+	formatRegex := regexp.MustCompile(`(?i)(\d+(?:st|nd|rd|th)?\s+(TEST|ODI|T20I|T20))`)
 	formatMatches := formatRegex.FindStringSubmatch(fullTitle)
-	if len(formatMatches) > 1 {
-		state.Format = formatMatches[2]
+	if len(formatMatches) > 2 {
+		state.Format = strings.ToUpper(formatMatches[2])
 	} else {
-		// Fallback for other formats
-		if strings.Contains(fullTitle, "Test") {
-			state.Format = "Test"
-		} else if strings.Contains(fullTitle, "ODI") {
-			state.Format = "ODI"
-		} else if strings.Contains(fullTitle, "T20") {
+		upperTitle := strings.ToUpper(fullTitle)
+
+		// priority: T20I > T20 > ODI > TEST
+		switch {
+		case strings.Contains(upperTitle, "T20I") || strings.Contains(upperTitle, "YOUTH T20I"):
+			state.Format = "T20I"
+		case strings.Contains(upperTitle, "T20") || strings.Contains(upperTitle, "YOUTH T20"):
 			state.Format = "T20"
+		case strings.Contains(upperTitle, "ODI") || strings.Contains(upperTitle, "YOUTH ODI"):
+			state.Format = "ODI"
+		case strings.Contains(upperTitle, "TEST"):
+			state.Format = "TEST"
+		default:
+			state.Format = ""
 		}
 	}
 	log.Printf("Parsed Format: %s", state.Format)
@@ -378,6 +411,24 @@ func parseScorecard(doc *goquery.Document) MatchState {
 	recentOversText := doc.Find(".cb-min-rcnt").Text()
 	state.RecentOvers = strings.TrimSpace(strings.TrimPrefix(recentOversText, "Recent:"))
 	log.Printf("RecentOvers: %s", state.RecentOvers)
+
+	// Yet to Bat
+	doc.Find("tr").Each(func(i int, s *goquery.Selection) {
+		firstCell := strings.TrimSpace(s.Find("td").First().Text())
+		if strings.HasPrefix(firstCell, "Yet to Bat") {
+			state.YetToBat = strings.TrimSpace(s.Find("td").Last().Text())
+		}
+	})
+
+	// Fall of Wickets (grab entire string; show only on wicket alert)
+	state.LastFoW = strings.TrimSpace(doc.Find(".cb-scrd-fll-wkt").First().Text())
+
+	// Target + required RR if chasing
+	needRegex := regexp.MustCompile(`Need (\d+) run(?:s)? in (\d+) ball`)
+	if m := needRegex.FindStringSubmatch(state.Status); len(m) == 3 {
+		state.TargetRuns, _ = strconv.Atoi(m[1])
+		state.TargetBalls, _ = strconv.Atoi(m[2])
+	}
 
 	// Venue
 	venueName := doc.Find(".cb-nav-subhdr").Find("a[itemprop='location'] span[itemprop='name']").First().Text()
@@ -441,10 +492,10 @@ func parseScorecard(doc *goquery.Document) MatchState {
 	return state
 }
 
-func checkPlayerMilestones(config Config, prev, current *MatchState) {
+func checkPlayerMilestones(config Config, prev, current *MatchState, milestones []int) {
 	for _, p := range current.CurrentPlayers {
 		lastMilestone := prev.NotifiedMilestone[p.Name]
-		for _, milestone := range config.PlayerMilestones {
+		for _, milestone := range milestones {
 			if p.Runs >= milestone && lastMilestone < milestone {
 				title := fmt.Sprintf("Milestone: %s reached %d!", p.Name, milestone)
 				sendDiscordAlert(config, title, 0xffd700, current)
@@ -514,6 +565,11 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 		fields = append(fields, DiscordEmbedField{Name: "Partnership", Value: state.Partnership, Inline: false})
 	}
 
+	// Yet to Bat
+	if state.YetToBat != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Next to Bat", Value: state.YetToBat, Inline: false})
+	}
+
 	// Last Wicket
 	if state.LastWicket != "" {
 		fields = append(fields, DiscordEmbedField{Name: "Last Wicket", Value: state.LastWicket, Inline: false})
@@ -534,8 +590,28 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 	if state.Venue != "" {
 		fields = append(fields, DiscordEmbedField{Name: "Venue", Value: state.Venue, Inline: false})
 	}
+	// Series
+	if state.Series != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Series", Value: state.Series, Inline: false})
+	}
+	// Format
+	if state.Format != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Format", Value: state.Format, Inline: true})
+	}
 
-	description := fmt.Sprintf("%s v %s - %s %s\n%s", state.Team1, state.Team2, state.Event, state.Format, state.Status)
+	// Chase requirements
+	if state.TargetRuns > 0 && state.TargetBalls > 0 {
+		rrr := float64(state.TargetRuns) / (float64(state.TargetBalls) / 6.0)
+		chase := fmt.Sprintf("%d off %d  |  RRR %.2f", state.TargetRuns, state.TargetBalls, rrr)
+		fields = append(fields, DiscordEmbedField{Name: "Target", Value: chase, Inline: false})
+	}
+
+	// If this is a wicket alert, surface FoW list
+	if strings.Contains(strings.ToLower(title), "wicket") && state.LastFoW != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Fall of Wickets", Value: state.LastFoW, Inline: false})
+	}
+
+	description := fmt.Sprintf("%s v %s\n%s", state.Team1, state.Team2, state.Status)
 	discordEmbed := DiscordEmbed{
 		Title:       title,
 		Description: description,
