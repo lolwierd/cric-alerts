@@ -537,7 +537,7 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 	// Main Score and Overs
 	if state.Score != "" {
 		scoreValue := fmt.Sprintf("%s (%s)", state.Score, state.Overs)
-		fields = append(fields, DiscordEmbedField{Name: "Score", Value: scoreValue, Inline: false})
+		fields = append(fields, DiscordEmbedField{Name: "🏏 Score", Value: scoreValue, Inline: false})
 	}
 
 	// Run Rate
