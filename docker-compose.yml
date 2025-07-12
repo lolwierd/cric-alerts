@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  cric-alerts:
+    build: .
+    env_file:
+      - .env
+    # volumes:
+    #   - ./:/app # Uncomment to mount local directory for development
+    ports:
+      - "8080:8080" # Uncomment if your app exposes a port
