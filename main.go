@@ -428,6 +428,14 @@ func getWickets(score string) int {
 func sendDiscordAlert(config Config, title string, color int, state *MatchState) {
 	var fields []DiscordEmbedField
 
+	// Reason for the alert
+	fields = append(fields, DiscordEmbedField{Name: "Alert", Value: title, Inline: false})
+
+	// Match status
+	if state.Status != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Status", Value: state.Status, Inline: false})
+	}
+
 	// Main Score and Overs
 	if state.Score != "" {
 		scoreValue := fmt.Sprintf("%s (%s)", state.Score, state.Overs)
