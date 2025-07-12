@@ -46,6 +46,7 @@ type MatchState struct {
 	Toss              string
 	Event             string // New field for the event/series name
 	Format            string // New field for match format (Test/ODI/T20)
+	Venue             string // Venue of the match
 }
 
 // Player represents a player's score.
@@ -294,9 +295,14 @@ func parseScorecard(doc *goquery.Document) MatchState {
 	}
 	log.Printf("Parsed Format: %s", state.Format)
 
-	// Status
-	state.Status = strings.TrimSpace(doc.Find(".cb-text-inprogress, .cb-text-complete, .cb-text-preview").First().Text())
+	// Status including session markers like Stumps or Lunch
+	state.Status = strings.TrimSpace(doc.Find(".cb-text-inprogress, .cb-text-complete, .cb-text-preview, .cb-text-stumps, .cb-text-lunch, .cb-text-tea").First().Text())
 	log.Printf("Status: %s", state.Status)
+
+	// Venue
+	venue := doc.Find(".cb-nav-subhdr").Find("a[itemprop='location'] span[itemprop='name']").First().Text()
+	state.Venue = strings.TrimSpace(strings.ReplaceAll(venue, "\u00a0", " "))
+	log.Printf("Venue: %s", state.Venue)
 
 	// Score and Overs
 	scoreAndOversText := doc.Find(".cb-min-bat-rw .cb-font-20.text-bold").Text()
@@ -428,6 +434,11 @@ func getWickets(score string) int {
 func sendDiscordAlert(config Config, title string, color int, state *MatchState) {
 	var fields []DiscordEmbedField
 
+	// Reason for alert
+	if title != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Alert", Value: title, Inline: false})
+	}
+
 	// Main Score and Overs
 	if state.Score != "" {
 		scoreValue := fmt.Sprintf("%s (%s)", state.Score, state.Overs)
@@ -475,9 +486,14 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 		fields = append(fields, DiscordEmbedField{Name: "Toss", Value: state.Toss, Inline: false})
 	}
 
+	// Venue
+	if state.Venue != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Venue", Value: state.Venue, Inline: false})
+	}
+
 	discordEmbed := DiscordEmbed{
 		Title:       fmt.Sprintf("%s v %s - %s %s", state.Team1, state.Team2, state.Event, state.Format),
-		Description: state.Status,
+		Description: fmt.Sprintf("%s\n%s", title, state.Status),
 		Color:       color,
 		Fields:      fields,
 		Footer: &DiscordEmbedFooter{
