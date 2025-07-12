@@ -46,6 +46,7 @@ type MatchState struct {
 	Toss              string
 	Event             string // New field for the event/series name
 	Format            string // New field for match format (Test/ODI/T20)
+	Venue             string // Venue of the match
 }
 
 // Player represents a player's score.
@@ -81,6 +82,7 @@ type DiscordEmbed struct {
 	Color       int                 `json:"color"`
 	Fields      []DiscordEmbedField `json:"fields"`
 	Footer      *DiscordEmbedFooter `json:"footer,omitempty"`
+	Timestamp   string              `json:"timestamp"`
 }
 
 // DiscordMessage represents a message to be sent to Discord.
@@ -215,17 +217,21 @@ func processMatch(href string, config Config, matchStates map[string]*MatchState
 
 	// Alerting logic
 	if config.AlertOnToss && !prevState.tossAlerted() && strings.Contains(newState.Toss, "won") {
-		sendDiscordAlert(config, "Toss Update", 0x00ff00, &newState)
+		sendDiscordAlert(config, fmt.Sprintf("Toss: %s", newState.Toss), 0x00ff00, &newState)
 	}
 
 	if config.AlertOnStart && !prevState.gameStarted() && strings.Contains(newState.Score, "/") {
-		sendDiscordAlert(config, "Match Started!", 0x00ff00, &newState)
+		sendDiscordAlert(config, "Match Started", 0x00ff00, &newState)
 		prevState.Score = "started"
 	}
 
 	if newState.Score != "" && prevState.Score != "started" && prevState.Score != newState.Score {
 		if config.AlertOnWicket && isWicketFall(prevState.Score, newState.Score) {
-			sendDiscordAlert(config, "Wicket!", 0xff0000, &newState)
+			title := "Wicket"
+			if newState.LastWicket != "" {
+				title = fmt.Sprintf("Wicket: %s", newState.LastWicket)
+			}
+			sendDiscordAlert(config, title, 0xff0000, &newState)
 		}
 
 		currentOver, _ := strconv.Atoi(strings.Split(newState.Overs, ".")[0])
@@ -295,7 +301,7 @@ func parseScorecard(doc *goquery.Document) MatchState {
 	log.Printf("Parsed Format: %s", state.Format)
 
 	// Status
-	state.Status = strings.TrimSpace(doc.Find(".cb-text-inprogress, .cb-text-complete, .cb-text-preview").First().Text())
+	state.Status = strings.TrimSpace(doc.Find(".cb-text-inprogress, .cb-text-complete, .cb-text-preview, .cb-text-stumps, .cb-text-lunch, .cb-text-tea").First().Text())
 	log.Printf("Status: %s", state.Status)
 
 	// Score and Overs
@@ -335,6 +341,17 @@ func parseScorecard(doc *goquery.Document) MatchState {
 	recentOversText := doc.Find(".cb-min-rcnt").Text()
 	state.RecentOvers = strings.TrimSpace(strings.TrimPrefix(recentOversText, "Recent:"))
 	log.Printf("RecentOvers: %s", state.RecentOvers)
+
+	// Venue
+	venueName := doc.Find(".cb-nav-subhdr").Find("a[itemprop='location'] span[itemprop='name']").First().Text()
+	locality := doc.Find(".cb-nav-subhdr").Find("a[itemprop='location'] span[itemprop='addressLocality']").First().Text()
+
+	venue := strings.TrimSpace(strings.ReplaceAll(venueName, "\u00a0", " "))
+	if locality != "" {
+		venue = fmt.Sprintf("%s %s", venue, strings.TrimSpace(locality))
+	}
+	state.Venue = venue
+	log.Printf("Venue: %s", state.Venue)
 
 	var players []Player
 	var bowler Player
@@ -392,7 +409,8 @@ func checkPlayerMilestones(config Config, prev, current *MatchState) {
 		lastMilestone := prev.NotifiedMilestone[p.Name]
 		for _, milestone := range config.PlayerMilestones {
 			if p.Runs >= milestone && lastMilestone < milestone {
-				sendDiscordAlert(config, "Milestone!", 0xffd700, current)
+				title := fmt.Sprintf("Milestone: %s reached %d!", p.Name, milestone)
+				sendDiscordAlert(config, title, 0xffd700, current)
 				current.NotifiedMilestone[p.Name] = milestone
 			}
 		}
@@ -431,12 +449,12 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 	// Main Score and Overs
 	if state.Score != "" {
 		scoreValue := fmt.Sprintf("%s (%s)", state.Score, state.Overs)
-		fields = append(fields, DiscordEmbedField{Name: "Score", Value: scoreValue, Inline: true})
+		fields = append(fields, DiscordEmbedField{Name: "Score", Value: scoreValue, Inline: false})
 	}
 
 	// Run Rate
 	if state.RunRate != "" {
-		fields = append(fields, DiscordEmbedField{Name: "Run Rate", Value: state.RunRate, Inline: true})
+		fields = append(fields, DiscordEmbedField{Name: "Run Rate", Value: state.RunRate, Inline: false})
 	}
 
 	// Batsmen
@@ -456,7 +474,7 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 
 	// Partnership
 	if state.Partnership != "" {
-		fields = append(fields, DiscordEmbedField{Name: "Partnership", Value: state.Partnership, Inline: true})
+		fields = append(fields, DiscordEmbedField{Name: "Partnership", Value: state.Partnership, Inline: false})
 	}
 
 	// Last Wicket
@@ -475,16 +493,22 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 		fields = append(fields, DiscordEmbedField{Name: "Toss", Value: state.Toss, Inline: false})
 	}
 
+	// Venue
+	if state.Venue != "" {
+		fields = append(fields, DiscordEmbedField{Name: "Venue", Value: state.Venue, Inline: false})
+	}
+
+	description := fmt.Sprintf("%s v %s - %s %s\n%s", state.Team1, state.Team2, state.Event, state.Format, state.Status)
 	discordEmbed := DiscordEmbed{
-		Title:       fmt.Sprintf("%s v %s - %s %s", state.Team1, state.Team2, state.Event, state.Format),
-		Description: state.Status,
+		Title:       title,
+		Description: description,
 		Color:       color,
 		Fields:      fields,
 		Footer: &DiscordEmbedFooter{
-			Text: time.Now().Format("Jan 2, 2006 at 3:04 PM MST"),
+			Text: "via CricAlerts",
 		},
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
-
 	discordMessage := DiscordMessage{
 		Username:  "Cric-Alerts",
 		AvatarURL: "https://www.cricbuzz.com/images/cb_logo.png", // You can change this to a custom avatar URL
