@@ -45,6 +45,7 @@ type MatchState struct {
 	NotifiedMilestone map[string]int
 	Toss              string
 	Event             string // New field for the event/series name
+	Format            string // New field for match format (Test/ODI/T20)
 }
 
 // Player represents a player's score.
@@ -185,20 +186,19 @@ func processMatch(href string, config Config, matchStates map[string]*MatchState
 		matchStates[matchID] = prevState
 	}
 
-	matchURL := "https://www.cricbuzz.com" + href
-	res, err := http.Get(matchURL)
+	resp, err := http.Get(fmt.Sprintf("https://www.cricbuzz.com/live-cricket-scores/%s", matchID))
 	if err != nil {
 		log.Printf("Error fetching match details for %s: %v", matchID, err)
 		return
 	}
-	defer res.Body.Close()
+	defer resp.Body.Close()
 
-	if res.StatusCode != 200 {
-		log.Printf("Error fetching match details for %s: Status code %d", matchID, res.StatusCode)
+	if resp.StatusCode != 200 {
+		log.Printf("Error fetching match details for %s: Status code %d", matchID, resp.StatusCode)
 		return
 	}
 
-	doc, err := goquery.NewDocumentFromReader(res.Body)
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		log.Printf("Error parsing match details for %s: %v", matchID, err)
 		return
@@ -276,6 +276,23 @@ func parseScorecard(doc *goquery.Document) MatchState {
 		}
 	}
 	log.Printf("Parsed Event: %s", state.Event)
+
+	// Extract Match Format
+	formatRegex := regexp.MustCompile(`(\d+(?:st|nd|rd|th)?\s+(Test|ODI|T20I|T20))`)
+	formatMatches := formatRegex.FindStringSubmatch(fullTitle)
+	if len(formatMatches) > 1 {
+		state.Format = formatMatches[2]
+	} else {
+		// Fallback for other formats
+		if strings.Contains(fullTitle, "Test") {
+			state.Format = "Test"
+		} else if strings.Contains(fullTitle, "ODI") {
+			state.Format = "ODI"
+		} else if strings.Contains(fullTitle, "T20") {
+			state.Format = "T20"
+		}
+	}
+	log.Printf("Parsed Format: %s", state.Format)
 
 	// Status
 	state.Status = strings.TrimSpace(doc.Find(".cb-text-inprogress, .cb-text-complete, .cb-text-preview").First().Text())
@@ -459,7 +476,7 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 	}
 
 	discordEmbed := DiscordEmbed{
-		Title:       fmt.Sprintf("%s v %s - %s", state.Team1, state.Team2, state.Event),
+		Title:       fmt.Sprintf("%s v %s - %s %s", state.Team1, state.Team2, state.Event, state.Format),
 		Description: state.Status,
 		Color:       color,
 		Fields:      fields,
