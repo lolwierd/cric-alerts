@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -17,14 +18,14 @@ import (
 
 // Config holds the configuration for the alerting service.
 type Config struct {
-	DiscordWebhookURL string
-	TargetTeam        string
-	PollInterval      time.Duration
-	AlertOnToss       bool
-	AlertOnStart      bool
-	AlertOnWicket     bool
-	AlertOnScoreEvery int // in overs
-	PlayerMilestones  []int
+	DiscordWebhookURLs []string
+	TargetTeam         string
+	PollInterval       time.Duration
+	AlertOnToss        bool
+	AlertOnStart       bool
+	AlertOnWicket      bool
+	AlertOnScoreEvery  int // in overs
+	PlayerMilestones   []int
 }
 
 // MatchState holds the current state of a match.
@@ -92,33 +93,65 @@ type DiscordMessage struct {
 	Embeds    []DiscordEmbed `json:"embeds"`
 }
 
+var (
+	matchStates = make(map[string]*MatchState)
+	mu          sync.RWMutex
+)
+
 func main() {
-	config := Config{
-		DiscordWebhookURL: os.Getenv("DISCORD_WEBHOOK_URL"), // Get your webhook URL from Discord
-		TargetTeam:        "IND",
-		PollInterval:      30 * time.Second,
-		AlertOnToss:       true,
-		AlertOnStart:      true,
-		AlertOnWicket:     true,
-		AlertOnScoreEvery: 5, // Alert every 5 overs
-		PlayerMilestones:  []int{50, 100, 150, 200, 250, 300},
+	urlsEnv := os.Getenv("DISCORD_WEBHOOK_URLS")
+	var urls []string
+	for _, u := range strings.Split(urlsEnv, ",") {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			urls = append(urls, u)
+		}
 	}
 
-	if config.DiscordWebhookURL == "" {
-		log.Fatal("DISCORD_WEBHOOK_URL environment variable not set.")
+	config := Config{
+		DiscordWebhookURLs: urls, // Get your webhook URL from Discord
+		TargetTeam:         "IND",
+		PollInterval:       30 * time.Second,
+		AlertOnToss:        true,
+		AlertOnStart:       true,
+		AlertOnWicket:      true,
+		AlertOnScoreEvery:  5, // Alert every 5 overs
+		PlayerMilestones:   []int{50, 100, 150, 200, 250, 300},
+	}
+
+	if len(config.DiscordWebhookURLs) == 0 {
+		log.Fatal("DISCORD_WEBHOOK_URLS environment variable not set.")
 	}
 
 	log.Printf("Starting cricket alerter for %s matches.", config.TargetTeam)
 
-	matchStates := make(map[string]*MatchState)
+	go func() {
+		for {
+			scrapeAndAlert(config)
+			time.Sleep(config.PollInterval)
+		}
+	}()
 
-	for {
-		scrapeAndAlert(config, matchStates)
-		time.Sleep(config.PollInterval)
-	}
+	http.HandleFunc("/alert", func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		defer mu.RUnlock()
+		for _, state := range matchStates {
+			sendDiscordAlert(config, "Manual Alert", 0x0000ff, state)
+		}
+		w.Write([]byte("alert sent"))
+	})
+
+	http.HandleFunc("/score", func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		defer mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(matchStates)
+	})
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func scrapeAndAlert(config Config, matchStates map[string]*MatchState) {
+func scrapeAndAlert(config Config) {
 	res, err := http.Get("https://www.cricbuzz.com/cricket-match/live-scores")
 	if err != nil {
 		log.Printf("Error fetching live scores: %v", err)
@@ -152,13 +185,13 @@ func scrapeAndAlert(config Config, matchStates map[string]*MatchState) {
 		if isTargetMatch {
 			targetCount++
 			href, _ := s.Attr("href")
-			processMatch(href, config, matchStates)
+			processMatch(href, config)
 		}
 	})
 	log.Printf("Processed %d matches for %s", targetCount, config.TargetTeam)
 }
 
-func processMatch(href string, config Config, matchStates map[string]*MatchState) {
+func processMatch(href string, config Config) {
 	if href == "" {
 		log.Printf("Skipping match without href")
 		return
@@ -177,6 +210,7 @@ func processMatch(href string, config Config, matchStates map[string]*MatchState
 		return
 	}
 
+	mu.Lock()
 	prevState, ok := matchStates[matchID]
 	if !ok {
 		log.Printf("Started tracking new match: %s", matchID)
@@ -187,6 +221,7 @@ func processMatch(href string, config Config, matchStates map[string]*MatchState
 		}
 		matchStates[matchID] = prevState
 	}
+	mu.Unlock()
 
 	resp, err := http.Get(fmt.Sprintf("https://www.cricbuzz.com/live-cricket-scores/%s", matchID))
 	if err != nil {
@@ -243,7 +278,9 @@ func processMatch(href string, config Config, matchStates map[string]*MatchState
 
 	checkPlayerMilestones(config, prevState, &newState)
 
+	mu.Lock()
 	matchStates[matchID] = &newState
+	mu.Unlock()
 }
 
 func parseScorecard(doc *goquery.Document) MatchState {
@@ -521,24 +558,26 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 		return
 	}
 
-	req, err := http.NewRequest("POST", config.DiscordWebhookURL, bytes.NewBuffer(payload))
-	if err != nil {
-		log.Printf("Error creating Discord request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
+	for _, webhookURL := range config.DiscordWebhookURLs {
+		req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(payload))
+		if err != nil {
+			log.Printf("Error creating Discord request: %v", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Error sending Discord message: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Error sending Discord message: %v", err)
+			continue
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode >= 300 {
-		log.Printf("Discord API returned non-2xx status: %d", resp.StatusCode)
-	} else {
-		log.Printf("Sent alert: %s", title)
+		if resp.StatusCode >= 300 {
+			log.Printf("Discord API returned non-2xx status: %d", resp.StatusCode)
+		} else {
+			log.Printf("Sent alert: %s", title)
+		}
 	}
 }
