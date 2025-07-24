@@ -1,0 +1,12 @@
+{
+  "monitored_teams": [
+    "IND",
+    "AUS"
+  ],
+  "alert_on_toss": true,
+  "alert_on_start": true,
+  "alert_on_wicket": true,
+  "alert_on_score_every": 5,
+  "current_match_url": "https://www.cricbuzz.com/live-cricket-scores/105778/ind-vs-eng-4th-test-india-tour-of-england-2025",
+  "guild_id": "698850934670884875"
+}

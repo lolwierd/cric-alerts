@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/bwmarrin/discordgo"
 )
 
 // Config holds the configuration for the alerting service.
@@ -26,7 +27,23 @@ type Config struct {
 	AlertOnWicket      bool
 	AlertOnScoreEvery  int // in overs
 	PlayerMilestones   []int
+
+	// Discord Bot configuration
+	DiscordBot     BotConfig
+	MonitoredTeams []string
+	EnableBot      bool
 }
+
+// BotConfig holds Discord bot specific configuration
+type BotConfig struct {
+	Token       string
+	GuildID     string
+	ChannelID   string
+	AdminRoleID string
+}
+
+// CommandHandler represents a function that handles Discord slash commands
+type CommandHandler func(s *discordgo.Session, i *discordgo.InteractionCreate)
 
 // MatchState holds the current state of a match.
 type MatchState struct {
@@ -48,10 +65,11 @@ type MatchState struct {
 	Series            string // Series/tournament name
 	Format            string // New field for match format (Test/ODI/T20)
 	Venue             string // Venue of the match
-	YetToBat    string
-	TargetRuns  int
-	TargetBalls int
-	LastFoW     string
+	YetToBat          string
+	TargetRuns        int
+	TargetBalls       int
+	LastFoW           string
+	OriginalURL       string // Full URL path from Cricbuzz for scoreboard access
 }
 
 // Player represents a player's score.
@@ -98,8 +116,13 @@ type DiscordMessage struct {
 }
 
 var (
-	matchStates = make(map[string]*MatchState)
-	mu          sync.RWMutex
+	matchStates    = make(map[string]*MatchState)
+	mu             sync.RWMutex
+	globalBot      *EnhancedDiscordBot // Global reference to bot for configuration access
+	globalConfig   *Config             // Global reference to app configuration
+	logger         *EnhancedLogger
+	circuitBreaker *CircuitBreaker
+	retryConfig    RetryConfig
 )
 
 func main() {
@@ -112,6 +135,33 @@ func main() {
 		}
 	}
 
+	// Load Discord bot configuration from environment variables
+	botConfig := BotConfig{
+		Token:       os.Getenv("DISCORD_BOT_TOKEN"),
+		GuildID:     os.Getenv("DISCORD_GUILD_ID"),
+		ChannelID:   os.Getenv("DISCORD_CHANNEL_ID"),
+		AdminRoleID: os.Getenv("DISCORD_ADMIN_ROLE_ID"),
+	}
+
+	// Parse monitored teams from environment variable
+	var monitoredTeams []string
+	teamsEnv := os.Getenv("MONITORED_TEAMS")
+	if teamsEnv != "" {
+		for _, team := range strings.Split(teamsEnv, ",") {
+			team = strings.TrimSpace(team)
+			if team != "" {
+				monitoredTeams = append(monitoredTeams, team)
+			}
+		}
+	}
+	// Default to IND if no teams specified
+	if len(monitoredTeams) == 0 {
+		monitoredTeams = []string{"IND"}
+	}
+
+	// Check if bot should be enabled
+	enableBot := os.Getenv("ENABLE_DISCORD_BOT") == "true"
+
 	config := Config{
 		DiscordWebhookURLs: urls, // Get your webhook URL from Discord
 		TargetTeam:         "IND",
@@ -121,18 +171,103 @@ func main() {
 		AlertOnWicket:      true,
 		AlertOnScoreEvery:  5, // Alert every 5 overs
 		PlayerMilestones:   []int{50, 100, 150, 200, 250, 300},
+		DiscordBot:         botConfig,
+		MonitoredTeams:     monitoredTeams,
+		EnableBot:          enableBot,
 	}
 
-	if len(config.DiscordWebhookURLs) == 0 {
-		log.Fatal("DISCORD_WEBHOOK_URLS environment variable not set.")
+	// Save global configuration reference for use in bot handlers
+	globalConfig = &config
+
+	if len(config.DiscordWebhookURLs) == 0 && !config.EnableBot {
+		log.Fatal("Either DISCORD_WEBHOOK_URLS or ENABLE_DISCORD_BOT=true must be set.")
 	}
 
-	log.Printf("Starting cricket alerter for %s matches.", config.TargetTeam)
+	// Initialize enhanced logging and reliability components
+	logger = NewEnhancedLogger("CRICKET_ALERTS")
+	circuitBreaker = NewCircuitBreaker("cricbuzz_api", 5, 60*time.Second)
+	retryConfig = DefaultRetryConfig()
+
+	logger.LogInfo("main", "Starting cricket alerter", map[string]interface{}{
+		"target_team":     config.TargetTeam,
+		"monitored_teams": config.MonitoredTeams,
+		"bot_enabled":     config.EnableBot,
+	})
+
+	// Initialize Discord bot if enabled
+	var bot *EnhancedDiscordBot
+	if config.EnableBot {
+		var err error
+		bot, err = NewDiscordBot(&config.DiscordBot)
+		if err != nil {
+			logger.LogError("main", err, map[string]interface{}{
+				"component": "discord_bot_init",
+			})
+		} else {
+			err = bot.Connect()
+			if err != nil {
+				logger.LogError("main", err, map[string]interface{}{
+					"component": "discord_bot_connect",
+				})
+				bot = nil
+			} else {
+				// Set global bot reference for configuration access
+				globalBot = bot
+				logger.LogInfo("main", "Discord bot connected successfully", map[string]interface{}{
+					"bot_user": bot.Session.State.User.Username,
+				})
+				// Ensure bot disconnects gracefully on shutdown
+				defer func() {
+					if bot != nil {
+						logger.LogInfo("main", "Disconnecting Discord bot", nil)
+						bot.Disconnect()
+					}
+				}()
+			}
+		}
+	}
 
 	go func() {
+		log.Printf("🚀 MONITORING: Starting monitoring goroutine")
 		for {
-			scrapeAndAlert(config)
-			time.Sleep(config.PollInterval)
+			// Check if monitoring should continue
+			isRunning := IsMonitoringRunning()
+			log.Printf("🔍 MONITORING: IsMonitoringRunning() = %v", isRunning)
+			if isRunning {
+				log.Printf("✅ MONITORING: About to run scrapeAndAlert...")
+				err := RetryWithBackoff(retryConfig, func() error {
+					return scrapeAndAlert(config)
+				})
+				if err != nil {
+					log.Printf("❌ MONITORING: scrapeAndAlert failed: %v", err)
+					logger.LogError("main", err, map[string]interface{}{
+						"component": "monitoring_loop",
+					})
+				} else {
+					log.Printf("✅ MONITORING: scrapeAndAlert completed successfully")
+				}
+
+				// Periodic logging of matchStates for debugging
+				mu.RLock()
+				currentCount := len(matchStates)
+				var matchIDs []string
+				for id, state := range matchStates {
+					matchIDs = append(matchIDs, fmt.Sprintf("%s(%s vs %s)", id, state.Team1, state.Team2))
+				}
+				mu.RUnlock()
+				log.Printf("PERIODIC CHECK: matchStates contains %d matches: %v", currentCount, matchIDs)
+			} else {
+				log.Printf("⏸️  MONITORING: Monitoring is paused/stopped")
+			}
+
+			// Use select to allow for interruption during sleep
+			select {
+			case <-GetMonitoringStopChannel():
+				logger.LogInfo("main", "Monitoring service received stop signal", nil)
+				// Continue the loop but monitoring will be paused
+			case <-time.After(config.PollInterval):
+				// Normal polling interval
+			}
 		}
 	}()
 
@@ -155,44 +290,109 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func scrapeAndAlert(config Config) {
-	res, err := http.Get("https://www.cricbuzz.com/cricket-match/live-scores")
-	if err != nil {
-		log.Printf("Error fetching live scores: %v", err)
-		return
-	}
-	defer res.Body.Close()
+func scrapeAndAlert(config Config) error {
+	scrapeStartTime := time.Now()
+	log.Printf("🚀 SCRAPING: Starting scrape cycle at %s", scrapeStartTime.Format("15:04:05.000"))
 
-	if res.StatusCode != 200 {
-		log.Printf("Status code error: %d %s", res.StatusCode, res.Status)
-		return
-	}
+	return circuitBreaker.Execute(func() error {
+		res, err := http.Get("https://www.cricbuzz.com/cricket-match/live-scores")
+		if err != nil {
+			logger.LogError("scrapeAndAlert", err, map[string]interface{}{
+				"url": "https://www.cricbuzz.com/cricket-match/live-scores",
+			})
+			return err
+		}
+		defer res.Body.Close()
 
-	doc, err := goquery.NewDocumentFromReader(res.Body)
-	if err != nil {
-		log.Printf("Error parsing HTML: %v", err)
-		return
-	}
+		if res.StatusCode != 200 {
+			err := fmt.Errorf("HTTP status code error: %d %s", res.StatusCode, res.Status)
+			logger.LogError("scrapeAndAlert", err, map[string]interface{}{
+				"status_code": res.StatusCode,
+				"status":      res.Status,
+			})
+			return err
+		}
 
-	totalMatches := doc.Find("a.cb-lv-scrs-well.cb-lv-scrs-well-live").Length()
-	log.Printf("Found %d live matches", totalMatches)
+		doc, err := goquery.NewDocumentFromReader(res.Body)
+		if err != nil {
+			logger.LogError("scrapeAndAlert", err, map[string]interface{}{
+				"component": "html_parsing",
+			})
+			return err
+		}
 
-	targetCount := 0
-	doc.Find("a.cb-lv-scrs-well.cb-lv-scrs-well-live").Each(func(i int, s *goquery.Selection) {
-		isTargetMatch := false
-		s.Find(".cb-hmscg-tm-nm").Each(func(_ int, team *goquery.Selection) {
-			if strings.Contains(team.Text(), config.TargetTeam) {
-				isTargetMatch = true
+		totalMatches := doc.Find("a.text-hvr-underline").Length()
+		log.Printf("🔢 SCRAPING: Found %d total matches at %s", totalMatches, time.Now().Format("15:04:05.000"))
+		logger.LogInfo("scrapeAndAlert", "Found live matches", map[string]interface{}{
+			"match_count": totalMatches,
+		})
+
+		// Get teams to monitor - use bot's dynamic configuration if available
+		teamsToMonitor := config.MonitoredTeams
+		if globalBot != nil {
+			// Try to get updated configuration from bot
+			if botConfig, err := globalBot.loadConfig(); err == nil && len(botConfig.MonitoredTeams) > 0 {
+				teamsToMonitor = botConfig.MonitoredTeams
+			}
+		}
+
+		// Fall back to TargetTeam if no teams configured
+		if len(teamsToMonitor) == 0 {
+			teamsToMonitor = []string{config.TargetTeam}
+		}
+
+		targetCount := 0
+		log.Printf("🎯 SCRAPING: Starting to process match containers at %s", time.Now().Format("15:04:05.000"))
+
+		// Find all match containers, including live, stumps, lunch, etc.
+		doc.Find("div.cb-mtch-lst.cb-col-100.cb-col").Each(func(i int, s *goquery.Selection) {
+			// Look for a live-score link within the container
+			link := s.Find("a.cb-lv-scrs-well.cb-lv-scrs-well-live, a.cb-lv-scrs-well.cb-stmp, a.cb-lv-scrs-well.cb-lunch, a.cb-lv-scrs-well.cb-rain").First()
+			if link.Length() == 0 {
+				return // Skip if no valid live/paused link
+			}
+			isTargetMatch := false
+
+			// Team names can appear under multiple selectors; check both at once
+			var foundTeams []string
+			s.Find(".cb-hmscg-tm-nm, .cb-col-50.cb-ovr-flo .text-normal").Each(func(_ int, team *goquery.Selection) {
+				teamText := strings.TrimSpace(team.Text())
+				if teamText != "" {
+					foundTeams = append(foundTeams, teamText)
+				}
+				for _, monitoredTeam := range teamsToMonitor {
+					if strings.Contains(teamText, monitoredTeam) {
+						log.Printf("Team match found: '%s' contains monitored team '%s'", teamText, monitoredTeam)
+						isTargetMatch = true
+						return
+					}
+				}
+			})
+			if len(foundTeams) > 0 {
+				log.Printf("Found teams in match %d: %v, monitored teams: %v, isTargetMatch: %v", i, foundTeams, teamsToMonitor, isTargetMatch)
+			}
+
+			if isTargetMatch {
+				targetCount++
+				href, _ := link.Attr("href")
+				log.Printf("⚡ SCRAPING: Processing target match at %s: %s", time.Now().Format("15:04:05.000"), href)
+				processMatch(href, config)
 			}
 		})
 
-		if isTargetMatch {
-			targetCount++
-			href, _ := s.Attr("href")
-			processMatch(href, config)
-		}
+		processingEndTime := time.Now()
+		processingDuration := processingEndTime.Sub(scrapeStartTime)
+		log.Printf("✅ SCRAPING: Completed scrape cycle at %s (took %v)", processingEndTime.Format("15:04:05.000"), processingDuration)
+		log.Printf("📊 SCRAPING: Processed %d target matches for teams: %v", targetCount, teamsToMonitor)
+
+		// Log current matchStates count after scraping
+		mu.RLock()
+		currentMatchCount := len(matchStates)
+		mu.RUnlock()
+		log.Printf("🏁 SCRAPING: matchStates now contains %d matches after scrape cycle", currentMatchCount)
+
+		return nil
 	})
-	log.Printf("Processed %d matches for %s", targetCount, config.TargetTeam)
 }
 
 func processMatch(href string, config Config) {
@@ -214,18 +414,13 @@ func processMatch(href string, config Config) {
 		return
 	}
 
-	mu.Lock()
-	prevState, ok := matchStates[matchID]
-	if !ok {
-		log.Printf("Started tracking new match: %s", matchID)
-		prevState = &MatchState{
-			MatchID:           matchID,
-			LastAlertedOver:   -1,
-			NotifiedMilestone: make(map[string]int),
-		}
-		matchStates[matchID] = prevState
-	}
-	mu.Unlock()
+	log.Printf("🔍 LOOKUP: Checking for existing match %s at %s", matchID, time.Now().Format("15:04:05.000"))
+	mu.RLock()
+	log.Printf("🧠 LOOKUP: Reading from matchStates map at address: %p", &matchStates)
+	prevState := matchStates[matchID]
+	lookupExists := prevState != nil
+	mu.RUnlock()
+	log.Printf("📖 LOOKUP: Match %s exists: %v at %s", matchID, lookupExists, time.Now().Format("15:04:05.000"))
 
 	resp, err := http.Get(fmt.Sprintf("https://www.cricbuzz.com/live-cricket-scores/%s", matchID))
 	if err != nil {
@@ -246,9 +441,22 @@ func processMatch(href string, config Config) {
 	}
 
 	newState := parseScorecard(doc)
+	// Preserve previously parsed team names if current scrape failed to detect them
+	if newState.Team1 == "" {
+		newState.Team1 = prevState.Team1
+	}
+	if newState.Team2 == "" {
+		newState.Team2 = prevState.Team2
+	}
+	// Re-use historical data that is still relevant
 	newState.MatchID = matchID
-	newState.LastAlertedOver = prevState.LastAlertedOver
-	newState.NotifiedMilestone = prevState.NotifiedMilestone
+	if prevState != nil {
+		newState.LastAlertedOver = prevState.LastAlertedOver
+		newState.NotifiedMilestone = prevState.NotifiedMilestone
+	} else {
+		newState.LastAlertedOver = -1
+		newState.NotifiedMilestone = make(map[string]int)
+	}
 
 	// decide alert cadence & milestones by match format
 	var scoreAlertEvery int
@@ -268,44 +476,106 @@ func processMatch(href string, config Config) {
 		milestones = config.PlayerMilestones
 	}
 
+	// Ensure prevState is non-nil for alert logic below
+	if prevState == nil {
+		prevState = &MatchState{}
+	}
+
 	log.Printf("Current state for match %s: %s vs %s, %s, %s %s, CRR: %s", matchID, newState.Team1, newState.Team2, newState.Status, newState.Score, newState.Overs, newState.RunRate)
 	log.Printf("Batsmen: %+v, Bowler: %+v", newState.CurrentPlayers, newState.CurrentBowler)
 	log.Printf("Partnership: %s, Last Wicket: %s, Recent: %s, Toss: %s", newState.Partnership, newState.LastWicket, newState.RecentOvers, newState.Toss)
 
+	log.Printf("🚦 ALERTING: Starting alert logic for match %s", matchID)
+
 	// Alerting logic
+	log.Printf("🚦 ALERTING: Checking toss alert - AlertOnToss: %v, tossAlerted: %v, hasToss: %v",
+		config.AlertOnToss, prevState.tossAlerted(), strings.Contains(newState.Toss, "won"))
 	if config.AlertOnToss && !prevState.tossAlerted() && strings.Contains(newState.Toss, "won") {
-		sendDiscordAlert(config, fmt.Sprintf("Toss: %s", newState.Toss), 0x00ff00, &newState)
+		log.Printf("🚦 ALERTING: Sending toss alert...")
+		go sendDiscordAlertWithSubscriptions(config, fmt.Sprintf("Toss: %s", newState.Toss), 0x00ff00, &newState, SubToss)
+		log.Printf("🚦 ALERTING: Toss alert sent successfully")
 	}
 
+	log.Printf("🚦 ALERTING: Checking start alert - AlertOnStart: %v, gameStarted: %v, hasScore: %v",
+		config.AlertOnStart, prevState.gameStarted(), strings.Contains(newState.Score, "/"))
 	if config.AlertOnStart && !prevState.gameStarted() && strings.Contains(newState.Score, "/") {
-		sendDiscordAlert(config, "Match Started", 0x00ff00, &newState)
+		log.Printf("🚦 ALERTING: Sending start alert...")
+		go sendDiscordAlertWithSubscriptions(config, "Match Started", 0x00ff00, &newState, SubStart)
+		log.Printf("🚦 ALERTING: Start alert sent successfully")
 		prevState.Score = "started"
 	}
 
+	log.Printf("🚦 ALERTING: Checking score changes - newScore: '%s', prevScore: '%s'", newState.Score, prevState.Score)
 	if newState.Score != "" && prevState.Score != "started" && prevState.Score != newState.Score {
+		log.Printf("🚦 ALERTING: Score changed, checking wicket alert...")
 		if config.AlertOnWicket && isWicketFall(prevState.Score, newState.Score) &&
 			newState.LastWicket != "" && newState.LastWicket != prevState.LastWicket {
+			log.Printf("🚦 ALERTING: Sending wicket alert...")
 			title := "Wicket"
 			if newState.LastWicket != "" {
 				title = fmt.Sprintf("Wicket: %s", newState.LastWicket)
 			}
-			sendDiscordAlert(config, title, 0xff0000, &newState)
+			go sendDiscordAlertWithSubscriptions(config, title, 0xff0000, &newState, SubWickets)
+			log.Printf("🚦 ALERTING: Wicket alert sent successfully")
 		}
 
+		log.Printf("🚦 ALERTING: Checking score alert...")
 		currentOver, _ := strconv.Atoi(strings.Split(newState.Overs, ".")[0])
 		if scoreAlertEvery > 0 && currentOver > prevState.LastAlertedOver && currentOver%scoreAlertEvery == 0 {
-			sendDiscordAlert(config, "Score Update", 0x0000ff, &newState)
+			log.Printf("🚦 ALERTING: Sending score alert...")
+			go sendDiscordAlert(config, "Score Update", 0x0000ff, &newState)
+			log.Printf("🚦 ALERTING: Score alert sent successfully")
 			newState.LastAlertedOver = currentOver
 		}
 	}
 
-	checkPlayerMilestones(config, prevState, &newState, milestones)
+	log.Printf("🚦 ALERTING: Checking player milestones...")
+	go checkPlayerMilestones(config, prevState, &newState, milestones)
+	log.Printf("🚦 ALERTING: Player milestones check completed")
 
+	log.Printf("🚦 ALERTING: All alerting logic completed for match %s", matchID)
+
+	// Persist the freshly parsed state. We overwrite the existing pointer (if
+	// any) with a pointer to the newState to ensure readers always see a fully
+	// populated object.
+	log.Printf("🔒 STORAGE: Attempting to acquire write lock for match %s at %s", matchID, time.Now().Format("15:04:05.000"))
 	mu.Lock()
+	log.Printf("✅ STORAGE: Write lock acquired for match %s at %s", matchID, time.Now().Format("15:04:05.000"))
+
+	// Store original URL for scorecard access
+	if strings.HasPrefix(href, "http") {
+		newState.OriginalURL = href
+	} else {
+		newState.OriginalURL = "https://www.cricbuzz.com" + href
+	}
+	log.Printf("🔗 STORAGE: Storing original URL for match %s: %s", matchID, newState.OriginalURL)
+
+	// Log memory address for debugging
+	log.Printf("🧠 STORAGE: Writing to matchStates map at address: %p", &matchStates)
+
 	matchStates[matchID] = &newState
+	currentMapSize := len(matchStates)
+	log.Printf("💾 STORAGE: Match %s successfully stored at %s", matchID, time.Now().Format("15:04:05.000"))
+
 	mu.Unlock()
+	log.Printf("🔓 STORAGE: Write lock released for match %s at %s", matchID, time.Now().Format("15:04:05.000"))
+	log.Printf("📊 STORED MATCH: %s (%s vs %s) - total tracked: %d", matchID, newState.Team1, newState.Team2, currentMapSize)
+
+	// Debug: List all current match IDs with details
+	log.Printf("🔍 DEBUG: Acquiring read lock to verify storage at %s", time.Now().Format("15:04:05.000"))
+	mu.RLock()
+	var matchDetails []string
+	for id, state := range matchStates {
+		matchDetails = append(matchDetails, fmt.Sprintf("%s(%s vs %s, %s)", id, state.Team1, state.Team2, state.Status))
+	}
+	verifyMapSize := len(matchStates)
+	mu.RUnlock()
+	log.Printf("✅ DEBUG: Read lock released, verified %d matches at %s", verifyMapSize, time.Now().Format("15:04:05.000"))
+	log.Printf("📋 ALL STORED MATCHES: %v", matchDetails)
+
 }
 
+// parseScorecard parses the Cricbuzz scorecard page and returns a fully populated MatchState
 func parseScorecard(doc *goquery.Document) MatchState {
 	var state MatchState
 
@@ -482,6 +752,7 @@ func parseScorecard(doc *goquery.Document) MatchState {
 						Wickets: wickets,
 					}
 				}
+
 			})
 		}
 	})
@@ -492,13 +763,239 @@ func parseScorecard(doc *goquery.Document) MatchState {
 	return state
 }
 
+func parseScoreboardPage(doc *goquery.Document) MatchState {
+	var state MatchState
+
+	// Extract teams from title
+	fullTitle := doc.Find("title").Text()
+	if strings.Contains(fullTitle, " vs ") {
+		titleParts := strings.Split(fullTitle, " vs ")
+		if len(titleParts) >= 2 {
+			// Extract team1 from "Cricket scorecard - England"
+			team1Part := titleParts[0]
+			if idx := strings.LastIndex(team1Part, " - "); idx != -1 {
+				state.Team1 = strings.TrimSpace(team1Part[idx+3:])
+			}
+
+			// Extract team2 from "India, 4th Test, ..."
+			team2Part := titleParts[1]
+			if idx := strings.Index(team2Part, ","); idx != -1 {
+				state.Team2 = strings.TrimSpace(team2Part[:idx])
+			}
+		}
+	}
+
+	// Extract series
+	seriesLink := doc.Find(".cb-nav-subhdr a").First()
+	if seriesLink.Length() > 0 {
+		state.Series = strings.TrimSpace(seriesLink.Text())
+	}
+
+	// Extract venue
+	venueSpan := doc.Find(".cb-nav-subhdr span[itemprop='name']").First()
+	localitySpan := doc.Find(".cb-nav-subhdr span[itemprop='addressLocality']").First()
+	if venueSpan.Length() > 0 {
+		venue := strings.TrimSpace(venueSpan.Text())
+		if localitySpan.Length() > 0 {
+			locality := strings.TrimSpace(localitySpan.Text())
+			if locality != "" && !strings.HasSuffix(venue, locality) {
+				if strings.HasSuffix(venue, ",") {
+					venue += " " + locality
+				} else {
+					venue += ", " + locality
+				}
+			}
+		}
+		state.Venue = venue
+	}
+
+	// Extract format from title
+	upperTitle := strings.ToUpper(fullTitle)
+	switch {
+	case strings.Contains(upperTitle, "T20I"):
+		state.Format = "T20I"
+	case strings.Contains(upperTitle, "T20"):
+		state.Format = "T20"
+	case strings.Contains(upperTitle, "ODI"):
+		state.Format = "ODI"
+	case strings.Contains(upperTitle, "TEST"):
+		state.Format = "TEST"
+	}
+
+	// Extract status
+	status := doc.Find(".cb-scrcrd-status").Text()
+	state.Status = strings.TrimSpace(status)
+
+	// Extract current innings score from the pull-right span
+	scoreSpan := doc.Find(".cb-scrd-hdr-rw .pull-right").First()
+	if scoreSpan.Length() > 0 {
+		scoreText := strings.TrimSpace(scoreSpan.Text())
+		// Parse format like "264-4 (83 Ov)"
+		if strings.Contains(scoreText, "(") && strings.Contains(scoreText, "Ov") {
+			parts := strings.Split(scoreText, "(")
+			if len(parts) >= 2 {
+				// Extract score part "264-4"
+				scorePart := strings.TrimSpace(parts[0])
+				if strings.Contains(scorePart, "-") {
+					// Convert "264-4" to "264/4" format for consistency
+					state.Score = strings.Replace(scorePart, "-", "/", 1)
+				}
+
+				// Extract overs from "(83 Ov)"
+				oversPart := parts[1]
+				if strings.Contains(oversPart, "Ov") {
+					oversText := strings.Replace(oversPart, "Ov)", "", 1)
+					oversText = strings.TrimSpace(oversText)
+					state.Overs = oversText
+
+					// Calculate run rate
+					if state.Score != "" && strings.Contains(state.Score, "/") {
+						scoreParts := strings.Split(state.Score, "/")
+						if len(scoreParts) >= 1 {
+							if runs, err := strconv.Atoi(scoreParts[0]); err == nil {
+								if overs, err := strconv.ParseFloat(oversText, 64); err == nil && overs > 0 {
+									runRate := float64(runs) / overs
+									state.RunRate = fmt.Sprintf("%.2f", runRate)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Extract toss information
+	doc.Find(".cb-mtch-info-itm").Each(func(i int, s *goquery.Selection) {
+		label := strings.TrimSpace(s.Find(".cb-col-27").Text())
+		value := strings.TrimSpace(s.Find(".cb-col-73").Text())
+		if label == "Toss" {
+			state.Toss = value
+		}
+	})
+
+	// Extract current batsmen from scorecard
+	var players []Player
+	doc.Find(".cb-scrd-itms").Each(func(i int, s *goquery.Selection) {
+		nameLink := s.Find("a.cb-text-link").First()
+		if nameLink.Length() > 0 {
+			name := strings.TrimSpace(nameLink.Text())
+			// Check if this is a batting entry (has runs, balls, etc.)
+			cols := s.Find("div[class*='cb-col']")
+			if cols.Length() >= 7 {
+				runsText := strings.TrimSpace(cols.Eq(2).Text())
+				ballsText := strings.TrimSpace(cols.Eq(3).Text())
+				foursText := strings.TrimSpace(cols.Eq(4).Text())
+				sixesText := strings.TrimSpace(cols.Eq(5).Text())
+
+				if runs, err := strconv.Atoi(runsText); err == nil {
+					player := Player{Name: name, Runs: runs}
+					if balls, err := strconv.Atoi(ballsText); err == nil {
+						player.Balls = balls
+					}
+					if fours, err := strconv.Atoi(foursText); err == nil {
+						player.Fours = fours
+					}
+					if sixes, err := strconv.Atoi(sixesText); err == nil {
+						player.Sixes = sixes
+					}
+
+					// Check if currently batting (no dismissal text)
+					dismissalText := strings.TrimSpace(s.Find(".cb-col-33").Text())
+					if dismissalText == "batting" {
+						players = append(players, player)
+					}
+				}
+			}
+		}
+	})
+	state.CurrentPlayers = players
+
+	// Extract current bowler from bowling figures
+	var bowler Player
+	doc.Find(".cb-scrd-itms").Each(func(i int, s *goquery.Selection) {
+		nameLink := s.Find("a.cb-text-link").First()
+		if nameLink.Length() > 0 {
+			name := strings.TrimSpace(nameLink.Text())
+			cols := s.Find("div[class*='cb-col']")
+
+			// Check if this looks like bowling figures (has overs, maidens, runs, wickets)
+			if cols.Length() >= 7 {
+				oversText := strings.TrimSpace(cols.Eq(1).Text())
+				maidensText := strings.TrimSpace(cols.Eq(2).Text())
+				runsText := strings.TrimSpace(cols.Eq(3).Text())
+				wicketsText := strings.TrimSpace(cols.Eq(4).Text())
+
+				// If we can parse these as bowling figures
+				if maidens, err := strconv.Atoi(maidensText); err == nil {
+					if runs, err := strconv.Atoi(runsText); err == nil {
+						if wickets, err := strconv.Atoi(wicketsText); err == nil {
+							bowler = Player{
+								Name:    name,
+								Overs:   oversText,
+								Maidens: maidens,
+								Runs:    runs,
+								Wickets: wickets,
+							}
+							return // Take the first bowler found
+						}
+					}
+				}
+			}
+		}
+	})
+	state.CurrentBowler = bowler
+
+	// Extract fall of wickets for last wicket
+	fowDiv := doc.Find(".cb-scrd-sub-hdr:contains('Fall of Wickets')").Next()
+	if fowDiv.Length() > 0 {
+		// Get all spans within the fall of wickets div
+		spans := fowDiv.Find("span")
+		if spans.Length() > 0 {
+			// Get the last span which contains the most recent wicket
+			lastSpan := spans.Last()
+			lastWicketText := strings.TrimSpace(lastSpan.Text())
+			// Remove trailing comma if present
+			lastWicketText = strings.TrimSuffix(lastWicketText, ",")
+			lastWicketText = strings.TrimSpace(lastWicketText)
+			if lastWicketText != "" {
+				state.LastWicket = lastWicketText
+			}
+		}
+	}
+
+	// Extract yet to bat
+	doc.Find(".cb-scrd-itms").Each(func(i int, s *goquery.Selection) {
+		firstCol := strings.TrimSpace(s.Find("div").First().Text())
+		if strings.Contains(firstCol, "Yet to Bat") {
+			yetToBat := strings.TrimSpace(s.Find("div").Last().Text())
+			// Clean up the yet to bat list - remove extra spaces
+			yetToBat = strings.ReplaceAll(yetToBat, " , ", ", ")
+			yetToBat = strings.ReplaceAll(yetToBat, "  ", " ")
+			state.YetToBat = yetToBat
+		}
+	})
+
+	// Extract partnership information if available from match info
+	doc.Find(".cb-key-st-lst .cb-min-itm-rw").Each(func(i int, s *goquery.Selection) {
+		label := strings.TrimSpace(s.Find("span.text-bold").Text())
+		value := strings.TrimSpace(s.Find("span").Last().Text())
+		switch label {
+		case "Partnership:":
+			state.Partnership = value
+		}
+	})
+
+	return state
+}
+
 func checkPlayerMilestones(config Config, prev, current *MatchState, milestones []int) {
 	for _, p := range current.CurrentPlayers {
 		lastMilestone := prev.NotifiedMilestone[p.Name]
 		for _, milestone := range milestones {
 			if p.Runs >= milestone && lastMilestone < milestone {
 				title := fmt.Sprintf("Milestone: %s reached %d!", p.Name, milestone)
-				sendDiscordAlert(config, title, 0xffd700, current)
+				sendDiscordAlertWithSubscriptions(config, title, 0xffd700, current, SubMilestones)
 				current.NotifiedMilestone[p.Name] = milestone
 			}
 		}
@@ -531,7 +1028,38 @@ func getWickets(score string) int {
 	return 0
 }
 
+// sendDiscordAlertWithSubscriptions sends alerts via both webhook and bot (with user mentions)
+func sendDiscordAlertWithSubscriptions(config Config, title string, color int, state *MatchState, alertType SubscriptionType) {
+	// Send via webhook (existing functionality) - make it non-blocking
+	go func() {
+		sendDiscordAlert(config, title, color, state)
+	}()
+
+	// Send via bot with user mentions if bot is available (non-blocking)
+	if globalBot != nil {
+		go func() {
+			err := globalBot.SendAlertWithMentions(title, color, state, alertType)
+			if err != nil {
+				log.Printf("Failed to send bot alert: %v", err)
+			}
+		}()
+	}
+}
+
 func sendDiscordAlert(config Config, title string, color int, state *MatchState) {
+	// Enhanced error handling wrapper
+	err := circuitBreaker.Execute(func() error {
+		return sendDiscordAlertInternal(config, title, color, state)
+	})
+	if err != nil {
+		logger.LogError("sendDiscordAlert", err, map[string]interface{}{
+			"title":    title,
+			"match_id": state.MatchID,
+		})
+	}
+}
+
+func sendDiscordAlertInternal(config Config, title string, color int, state *MatchState) error {
 	var fields []DiscordEmbedField
 
 	// Main Score and Overs
@@ -631,29 +1159,29 @@ func sendDiscordAlert(config Config, title string, color int, state *MatchState)
 	payload, err := json.Marshal(discordMessage)
 	if err != nil {
 		log.Printf("Error marshalling Discord message: %v", err)
-		return
+		return fmt.Errorf("error marshalling Discord message: %v", err)
 	}
 
 	for _, webhookURL := range config.DiscordWebhookURLs {
 		req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(payload))
 		if err != nil {
-			log.Printf("Error creating Discord request: %v", err)
+			log.Printf("Error creating request: %v", err)
 			continue
 		}
+
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("Error sending Discord message: %v", err)
+			log.Printf("Error sending Discord webhook: %v", err)
 			continue
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode >= 300 {
-			log.Printf("Discord API returned non-2xx status: %d", resp.StatusCode)
-		} else {
-			log.Printf("Sent alert: %s", title)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("Discord webhook returned status: %d", resp.StatusCode)
 		}
 	}
+	return nil
 }
