@@ -207,10 +207,8 @@ func NewEnhancedLogger(prefix string) *EnhancedLogger {
 // LogError logs an error with context
 func (el *EnhancedLogger) LogError(operation string, err error, context map[string]interface{}) {
 	contextStr := ""
-	if context != nil {
-		for key, value := range context {
-			contextStr += fmt.Sprintf("%s=%v ", key, value)
-		}
+	for key, value := range context {
+		contextStr += fmt.Sprintf("%s=%v ", key, value)
 	}
 	log.Printf("ERROR [%s] %s failed: %v | Context: %s", el.prefix, operation, err, contextStr)
 }
@@ -218,10 +216,8 @@ func (el *EnhancedLogger) LogError(operation string, err error, context map[stri
 // LogWarning logs a warning with context
 func (el *EnhancedLogger) LogWarning(operation string, message string, context map[string]interface{}) {
 	contextStr := ""
-	if context != nil {
-		for key, value := range context {
-			contextStr += fmt.Sprintf("%s=%v ", key, value)
-		}
+	for key, value := range context {
+		contextStr += fmt.Sprintf("%s=%v ", key, value)
 	}
 	log.Printf("WARN [%s] %s: %s | Context: %s", el.prefix, operation, message, contextStr)
 }
@@ -229,10 +225,8 @@ func (el *EnhancedLogger) LogWarning(operation string, message string, context m
 // LogInfo logs informational messages
 func (el *EnhancedLogger) LogInfo(operation string, message string, context map[string]interface{}) {
 	contextStr := ""
-	if context != nil {
-		for key, value := range context {
-			contextStr += fmt.Sprintf("%s=%v ", key, value)
-		}
+	for key, value := range context {
+		contextStr += fmt.Sprintf("%s=%v ", key, value)
 	}
 	log.Printf("INFO [%s] %s: %s | Context: %s", el.prefix, operation, message, contextStr)
 }
