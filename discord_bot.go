@@ -16,6 +16,14 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+// toTitle converts the first letter of s to upper case and the rest to lower case.
+func toTitle(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
+}
+
 // Command represents a Discord slash command
 type Command struct {
 	Name        string
@@ -50,7 +58,9 @@ func NewSubscriptionManager(filePath string) *SubscriptionManager {
 	}
 
 	// Load existing subscriptions from file
-	sm.loadFromFile()
+	if err := sm.loadFromFile(); err != nil {
+		log.Printf("Error loading subscriptions: %v", err)
+	}
 
 	return sm
 }
@@ -249,7 +259,7 @@ func (sm *SubscriptionManager) saveToFile() error {
 		return fmt.Errorf("error marshaling subscription data: %v", err)
 	}
 
-	err = os.WriteFile(sm.filePath, data, 0644)
+	err = os.WriteFile(sm.filePath, data, 0600)
 	if err != nil {
 		return fmt.Errorf("error writing subscription file: %v", err)
 	}
@@ -697,7 +707,7 @@ func (bot *EnhancedDiscordBot) respondWithEmbed(s *discordgo.Session, i *discord
 // respondWithUserFriendlyError handles UserFriendlyError types with enhanced messaging
 func (bot *EnhancedDiscordBot) respondWithUserFriendlyError(s *discordgo.Session, i *discordgo.InteractionCreate, err error) {
 	var userMessage string
-	var color int = 0xff0000 // Red for errors
+	color := 0xff0000 // Red for errors
 
 	// Check if it's a UserFriendlyError
 	if ufe, ok := err.(*UserFriendlyError); ok {
@@ -906,7 +916,7 @@ func (bot *EnhancedDiscordBot) saveConfig(config *ConfigData) error {
 		return fmt.Errorf("error marshaling config: %v", err)
 	}
 
-	err = os.WriteFile(configPath, data, 0644)
+	err = os.WriteFile(configPath, data, 0600)
 	if err != nil {
 		return fmt.Errorf("error writing config file: %v", err)
 	}
@@ -1251,7 +1261,9 @@ func (bot *EnhancedDiscordBot) handleMatchCommand(s *discordgo.Session, i *disco
 		log.Printf("Error loading config: %v", err)
 	} else {
 		config.CurrentMatchURL = currentMatchURL
-		bot.saveConfig(config)
+		if err := bot.saveConfig(config); err != nil {
+			log.Printf("Error saving config: %v", err)
+		}
 	}
 
 	// Create detailed embed response
@@ -1440,7 +1452,13 @@ func (bot *EnhancedDiscordBot) handleScoreboardCommand(s *discordgo.Session, i *
 
 	for i, url := range urlsToTry {
 		log.Printf("🌍 SCOREBOARD: Attempt %d - Fetching URL: %s", i+1, url)
-		resp, err = http.Get(url)
+		if !strings.HasPrefix(url, "https://www.cricbuzz.com/") {
+			log.Printf("❌ SCOREBOARD: URL not allowed: %s", url)
+			lastError = fmt.Errorf("disallowed domain")
+			continue
+		}
+		// Domain is validated above
+		resp, err = http.Get(url) // #nosec G107
 		if err != nil {
 			log.Printf("❌ SCOREBOARD: Network error for URL %s: %v", url, err)
 			lastError = err
@@ -1453,7 +1471,9 @@ func (bot *EnhancedDiscordBot) handleScoreboardCommand(s *discordgo.Session, i *
 			break
 		} else {
 			log.Printf("📟 SCOREBOARD: HTTP %d for URL: %s", resp.StatusCode, url)
-			resp.Body.Close()
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Printf("Error closing response body: %v", errClose)
+			}
 			lastError = fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 	}
@@ -1467,7 +1487,11 @@ func (bot *EnhancedDiscordBot) handleScoreboardCommand(s *discordgo.Session, i *
 		}
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Error closing response body: %v", err)
+		}
+	}()
 
 	log.Printf("🎉 SCOREBOARD: Successfully fetched scorecard from: %s", finalURL)
 
@@ -1951,7 +1975,7 @@ func (bot *EnhancedDiscordBot) getToggleButtonStyle(enabled bool) discordgo.Butt
 // sendMessageWithRetry sends a message and retries on Discord rate-limit errors with exponential backoff.
 func (bot *EnhancedDiscordBot) sendMessageWithRetry(msg *discordgo.MessageSend) error {
 	const maxAttempts = 3
-	var delay time.Duration = 1 * time.Second
+	delay := time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		_, err := bot.Session.ChannelMessageSendComplex(bot.Config.ChannelID, msg)
@@ -2220,7 +2244,7 @@ func (bot *EnhancedDiscordBot) handleSubscribeCommand(s *discordgo.Session, i *d
 
 	embed.Fields = []*discordgo.MessageEmbedField{
 		{
-			Name:   fmt.Sprintf("📢 %s Alerts", strings.Title(string(subscriptionType))),
+			Name:   fmt.Sprintf("📢 %s Alerts", toTitle(string(subscriptionType))),
 			Value:  alertInfo,
 			Inline: false,
 		},

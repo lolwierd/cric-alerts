@@ -220,7 +220,9 @@ func main() {
 				defer func() {
 					if bot != nil {
 						logger.LogInfo("main", "Disconnecting Discord bot", nil)
-						bot.Disconnect()
+						if err := bot.Disconnect(); err != nil {
+							log.Printf("error disconnecting bot: %v", err)
+						}
 					}
 				}()
 			}
@@ -277,17 +279,27 @@ func main() {
 		for _, state := range matchStates {
 			sendDiscordAlert(config, "Manual Alert", 0x0000ff, state)
 		}
-		w.Write([]byte("alert sent"))
+		if _, err := w.Write([]byte("alert sent")); err != nil {
+			log.Printf("error writing response: %v", err)
+		}
 	})
 
 	http.HandleFunc("/score", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(matchStates)
+		if err := json.NewEncoder(w).Encode(matchStates); err != nil {
+			log.Printf("error encoding score response: %v", err)
+		}
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	server := &http.Server{
+		Addr:         ":8080",
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	log.Fatal(server.ListenAndServe())
 }
 
 func scrapeAndAlert(config Config) error {
@@ -302,7 +314,11 @@ func scrapeAndAlert(config Config) error {
 			})
 			return err
 		}
-		defer res.Body.Close()
+		defer func() {
+			if err := res.Body.Close(); err != nil {
+				log.Printf("error closing response body: %v", err)
+			}
+		}()
 
 		if res.StatusCode != 200 {
 			err := fmt.Errorf("HTTP status code error: %d %s", res.StatusCode, res.Status)
@@ -427,7 +443,11 @@ func processMatch(href string, config Config) {
 		log.Printf("Error fetching match details for %s: %v", matchID, err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("error closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != 200 {
 		log.Printf("Error fetching match details for %s: Status code %d", matchID, resp.StatusCode)
@@ -1177,7 +1197,11 @@ func sendDiscordAlertInternal(config Config, title string, color int, state *Mat
 			log.Printf("Error sending Discord webhook: %v", err)
 			continue
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("error closing webhook response: %v", err)
+			}
+		}()
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			log.Printf("Discord webhook returned status: %d", resp.StatusCode)
